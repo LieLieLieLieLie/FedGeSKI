@@ -12,7 +12,7 @@ FIGURES_DIR = RESULTS_DIR / "figures"
 MODELS_DIR = RESULTS_DIR / "models"
 TABLES_DIR = RESULTS_DIR / "tables"
 LOGS_DIR = RESULTS_DIR / "logs"
-PAPER_FIGURES_DIR = ROOT.parent / "paper" / "EAAI" / "figures"
+PAPER_FIGURES_DIR = ROOT.parent / "paper" / "KBS" / "figures"
 
 # Keep paper-figure synchronization for the full local research workspace while
 # making a standalone GitHub checkout self-contained.
@@ -38,37 +38,55 @@ DATASETS: Dict[str, Dict[str, object]] = {
 
 
 METHODS: Tuple[str, ...] = (
-    "fedavg_er",
+    "fedgcc",
+    "afcl_csc",
+    "fedavgm",
+    "fedadam",
+    "fedyogi",
+    "fedasync",
+    "fedbuff",
     "glfc",
     "evofedids",
     "fedta",
     "fedagc",
-    "fedmosaic",
+    "fedgeski",
 )
 
 METHOD_LABELS = {
-    "fedavg_er": "FedAvg-ER",
+    "fedgcc": "Fed-GCC",
+    "afcl_csc": "AFCL-CSC",
+    "fedavgm": "FedAvgM",
+    "fedadam": "FedAdam",
+    "fedyogi": "FedYogi",
+    "fedasync": "FedAsync",
+    "fedbuff": "FedBuff",
     "glfc": "GLFC",
     "evofedids": "EvoFedIDS",
     "fedta": "FedTA",
     "fedagc": "FedAGC",
-    "fedmosaic": "FedMOSAIC",
+    "fedgeski": "FedGeSKI",
 }
 
 METHOD_COLORS = {
-    "fedavg_er": "#FFAA53",
-    "glfc": "#50CC55",
-    "evofedids": "#3399FF",
-    "fedta": "#6666FF",
-    "fedagc": "#9933FF",
-    "fedmosaic": "#FF6666",
+    "fedgcc": "#FFAA53",
+    "afcl_csc": "#50CC55",
+    "fedavgm": "#3399FF",
+    "fedadam": "#6666FF",
+    "fedyogi": "#9933FF",
+    "fedasync": "#2A9D8F",
+    "fedbuff": "#E76F51",
+    "glfc": "#00DDDD",
+    "evofedids": "#4D4D4D",
+    "fedta": "#8C564B",
+    "fedagc": "#CC6699",
+    "fedgeski": "#FF6666",
 }
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     dataset: str = "edgeiiot"
-    method: str = "fedmosaic"
+    method: str = "fedgeski"
     variant: str = "full"
     seed: int = 0
     num_clients: int = 10
@@ -86,17 +104,22 @@ class ExperimentConfig:
     embed_dim: int = 32
     dropout: float = 0.10
     replay_per_class: int = 24
-    synthetic_per_class: int = 12
+    synthetic_per_class: int = 24
     anchor_weight: float = 0.9
     stability_weight: float = 0.20
-    calibration_weight: float = 0.15
+    calibration_weight: float = 0.0
     proximal_weight: float = 0.01
     distill_weight: float = 0.7
     temperature: float = 0.20
     staleness_tau: float = 2.0
     server_momentum: float = 0.0
+    server_optimizer_lr: float = 0.01
+    server_beta1: float = 0.90
+    server_beta2: float = 0.99
+    server_tau: float = 1e-3
     server_consolidation_steps: int = 2
     server_learning_rate: float = 8e-4
+    history_length: int = 6
     eval_every: int = 1
     device: str = "cuda"
 

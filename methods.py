@@ -68,6 +68,7 @@ class ReplayBuffer:
 @dataclass
 class ClientState:
     replay: ReplayBuffer
+    class_counts: Dict[int, int] = field(default_factory=dict)
     drift_mean: float = 0.0
     drift_cumulative: float = 0.0
     drift_minimum: float = 0.0
@@ -80,6 +81,7 @@ class LocalResult:
     samples: int
     train_loss: float
     reliability: float
+    anchor_alignment: float
     staleness: int
     class_ids: torch.Tensor
     feature_means: torch.Tensor
@@ -89,8 +91,69 @@ class LocalResult:
     input_variances: torch.Tensor
     input_counts: torch.Tensor
     communication_bytes: int
+    uplink_communication_bytes: int
+    downlink_communication_bytes: int
     auxiliary_memory_bytes: int
     drift_event: bool
+    update_id: Tuple[int, int]
+
+
+def _encode_input_bank_snapshot(
+    server_stats: SimplexStatistics,
+) -> Tuple[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
+    """Encode the server-to-client input-moment bank used for local augmentation.
+
+    Only active class identifiers and the corresponding input-space means and
+    variances are required to draw the transient samples.  The snapshot uses
+    the same FP16 moment representation as the uplink capsule and is decoded
+    before local arithmetic.  Counts and latent moments are intentionally not
+    broadcast because local sampling does not consume them.
+    """
+    available = torch.nonzero(server_stats.input_counts > 0, as_tuple=False).flatten()
+    if available.numel() == 0 or server_stats.input_means.shape[1] == 0:
+        return None, 0
+    encoded_ids = available.to(torch.uint8)
+    encoded_means = server_stats.input_means[available].to(torch.float16)
+    encoded_variances = server_stats.input_variances[available].to(torch.float16)
+    payload_bytes = int(
+        encoded_ids.numel() * encoded_ids.element_size()
+        + encoded_means.numel() * encoded_means.element_size()
+        + encoded_variances.numel() * encoded_variances.element_size()
+    )
+    return (
+        encoded_ids.to(torch.long),
+        encoded_means.to(torch.float32),
+        encoded_variances.to(torch.float32),
+    ), payload_bytes
+
+
+def _sample_input_bank_snapshot(
+    snapshot: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    samples_per_class: int,
+    generator: torch.Generator,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if snapshot is None:
+        return None
+    class_ids, means, variances = snapshot
+    samples: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    for row, class_id in enumerate(class_ids):
+        noise = torch.randn(
+            samples_per_class,
+            means.shape[1],
+            generator=generator,
+            device=means.device,
+        )
+        samples.append((means[row] + noise * variances[row].clamp_min(1e-5).sqrt()).clamp(-12.0, 12.0))
+        labels.append(
+            torch.full(
+                (samples_per_class,),
+                int(class_id.item()),
+                dtype=torch.long,
+                device=means.device,
+            )
+        )
+    return torch.cat(samples, dim=0), torch.cat(labels, dim=0)
 
 
 def _encode_statistic_capsule(
@@ -110,7 +173,7 @@ def _encode_statistic_capsule(
     of merely reporting a smaller byte count.
     """
     if torch.any(feature_counts < 0) or torch.any(input_counts < 0):
-        raise ValueError("Sufficient-statistic counts must be non-negative")
+        raise ValueError("Moment-statistic counts must be non-negative")
     if torch.any(feature_counts > 32767) or torch.any(input_counts > 32767):
         raise ValueError("Statistic capsule Int16 count overflow")
 
@@ -134,6 +197,42 @@ def _encode_statistic_capsule(
         encoded_moments[2].to(torch.float32),
         encoded_moments[3].to(torch.float32),
         encoded_input_counts.to(torch.float32),
+        payload_bytes,
+    )
+
+
+def _encode_input_statistic_capsule(
+    class_ids: torch.Tensor,
+    input_means: torch.Tensor,
+    input_variances: torch.Tensor,
+    input_counts: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Encode the training-relevant FedGeSKI capsule.
+
+    Pooled latent moments are deliberately excluded: the server does not use
+    them for aggregation or consolidation.  Alignment is reduced locally to a
+    scalar reliability value, while the transmitted bank contains only the
+    input moments required by transient moment replay.
+    """
+    if torch.any(input_counts < 0) or torch.any(input_counts > 32767):
+        raise ValueError("Input-statistic Int16 count overflow")
+    encoded_ids = class_ids.to(torch.uint8)
+    encoded_means = input_means.to(torch.float16)
+    encoded_variances = input_variances.to(torch.float16)
+    encoded_counts = input_counts.round().to(torch.int16)
+    # Four bytes for reliability and four bytes for the immutable update ID.
+    metadata_bytes = 8
+    payload_bytes = int(
+        encoded_ids.numel() * encoded_ids.element_size()
+        + encoded_means.numel() * encoded_means.element_size()
+        + encoded_variances.numel() * encoded_variances.element_size()
+        + encoded_counts.numel() * encoded_counts.element_size()
+        + metadata_bytes
+    )
+    return (
+        encoded_means.to(torch.float32),
+        encoded_variances.to(torch.float32),
+        encoded_counts.to(torch.float32),
         payload_bytes,
     )
 
@@ -222,7 +321,14 @@ def train_client(
     torch_generator = torch.Generator(device=device)
     torch_generator.manual_seed(config.seed * 100000 + round_id * 100 + client_id + 17)
 
-    uses_replay = method in {"fedavg_er", "glfc", "evofedids", "fedagc"}
+    uses_global_input_bank = (
+        method == "fedgeski" and config.variant not in {"no_stats", "simplex_only"}
+    )
+    input_bank_snapshot, input_bank_downlink_bytes = (
+        _encode_input_bank_snapshot(server_stats) if uses_global_input_bank else (None, 0)
+    )
+
+    uses_replay = method in {"glfc", "evofedids", "fedagc"}
     for _ in range(config.local_steps):
         x_current, y_current, indices = stream.sample_batch(
             client_id, round_id, config.batch_size, rng, device
@@ -261,8 +367,9 @@ def train_client(
             features = features_current
             labels = y_current
         else:
-            if method == "fedmosaic" and config.variant != "no_stats":
-                synthetic = server_stats.sample_inputs(
+            if uses_global_input_bank:
+                synthetic = _sample_input_bank_snapshot(
+                    input_bank_snapshot,
                     samples_per_class=config.synthetic_per_class, generator=torch_generator
                 )
             else:
@@ -280,6 +387,7 @@ def train_client(
 
             optimizer.zero_grad(set_to_none=True)
             logits, features = local(x_batch, return_features=True)
+            did_step = False
             if method == "glfc":
                 loss = _focal_cross_entropy(logits, y_batch)
                 with torch.no_grad():
@@ -291,6 +399,72 @@ def train_client(
                     reduction="batchmean",
                 ) * 4.0
                 loss = loss + config.distill_weight * kd
+            elif method == "fedgcc":
+                # Fixed-head adaptation of global classifier consensus: the
+                # cumulative quantity term counteracts client-local imbalance,
+                # while confidence-weighted distillation keeps every client
+                # aligned with the current global classifier without task IDs.
+                for class_id, count in zip(*torch.unique(y_current, return_counts=True)):
+                    key = int(class_id.item())
+                    client_state.class_counts[key] = client_state.class_counts.get(key, 0) + int(count.item())
+                class_weight = torch.ones(logits.shape[1], device=device)
+                for class_id, count in client_state.class_counts.items():
+                    class_weight[class_id] = 1.0 / math.sqrt(max(count, 1))
+                active = torch.tensor(list(client_state.class_counts), device=device, dtype=torch.long)
+                class_weight = class_weight / class_weight[active].mean().clamp_min(1e-6)
+                with torch.no_grad():
+                    teacher_logits = reference(x_batch)
+                    teacher_confidence = torch.softmax(teacher_logits, dim=1).max(dim=1).values
+                ce = F.cross_entropy(logits, y_batch, weight=class_weight)
+                kd_per_sample = F.kl_div(
+                    F.log_softmax(logits / 2.0, dim=1),
+                    F.softmax(teacher_logits / 2.0, dim=1),
+                    reduction="none",
+                ).sum(dim=1) * 4.0
+                quality_kd = (teacher_confidence * kd_per_sample).sum() / teacher_confidence.sum().clamp_min(1e-6)
+                loss = ce + 0.55 * quality_kd + 2e-5 * _reference_penalty(local, reference)
+            elif method == "afcl_csc":
+                # Protocol-aligned client--server cooperative control: local
+                # sharpness-aware training preserves a flat solution, and the
+                # server later combines it with similarity/staleness weighting.
+                with torch.no_grad():
+                    teacher_logits = reference(x_batch)
+                base_loss = F.cross_entropy(logits, y_batch)
+                base_loss = base_loss + 0.45 * F.kl_div(
+                    F.log_softmax(logits / 2.0, dim=1),
+                    F.softmax(teacher_logits / 2.0, dim=1),
+                    reduction="batchmean",
+                ) * 4.0
+                base_loss.backward()
+                grad_norm = torch.sqrt(sum(
+                    parameter.grad.detach().pow(2).sum()
+                    for parameter in local.parameters() if parameter.grad is not None
+                )).clamp_min(1e-8)
+                perturbations = []
+                with torch.no_grad():
+                    for parameter in local.parameters():
+                        perturbation = (
+                            torch.zeros_like(parameter)
+                            if parameter.grad is None
+                            else 0.025 * parameter.grad / grad_norm
+                        )
+                        parameter.add_(perturbation)
+                        perturbations.append(perturbation)
+                optimizer.zero_grad(set_to_none=True)
+                logits_adv, _ = local(x_batch, return_features=True)
+                loss = F.cross_entropy(logits_adv, y_batch)
+                loss = loss + 0.45 * F.kl_div(
+                    F.log_softmax(logits_adv / 2.0, dim=1),
+                    F.softmax(teacher_logits / 2.0, dim=1),
+                    reduction="batchmean",
+                ) * 4.0
+                loss.backward()
+                with torch.no_grad():
+                    for parameter, perturbation in zip(local.parameters(), perturbations):
+                        parameter.sub_(perturbation)
+                torch.nn.utils.clip_grad_norm_(local.parameters(), max_norm=8.0)
+                optimizer.step()
+                did_step = True
             elif method == "evofedids":
                 loss = F.cross_entropy(logits, y_batch)
                 loss = loss + 0.18 * supervised_contrastive_loss(
@@ -304,13 +478,12 @@ def train_client(
                 loss = F.cross_entropy(logits, y_batch)
                 loss = loss + 0.55 * F.cross_entropy(anchor_logits, y_batch)
                 loss = loss + 0.20 * (1.0 - (normalized * target_anchor).sum(dim=1)).mean()
-            elif method == "fedmosaic":
-                server_stats.active[torch.unique(y_batch)] = True
+            elif method == "fedgeski":
                 normalized = F.normalize(features, dim=1)
                 anchor_logits = normalized @ server_stats.anchors.T / config.temperature
                 target_anchor = server_stats.anchors[y_batch]
                 alignment = (1.0 - (normalized * target_anchor).sum(dim=1)).mean()
-                if config.variant == "no_simplex":
+                if config.variant in {"no_simplex", "stats_only", "stats_fusion"}:
                     loss = F.cross_entropy(logits, y_batch)
                 else:
                     loss = F.cross_entropy(logits + 0.35 * anchor_logits, y_batch)
@@ -320,9 +493,10 @@ def train_client(
                 anchor_residuals.append(float(alignment.detach().item()))
             else:
                 loss = F.cross_entropy(logits, y_batch)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(local.parameters(), max_norm=8.0)
-            optimizer.step()
+            if not did_step:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(local.parameters(), max_norm=8.0)
+                optimizer.step()
             labels = y_batch
 
         losses.append(float(loss.detach().item()))
@@ -344,32 +518,26 @@ def train_client(
         inputs_all, input_labels_all
     )
     if not torch.equal(class_ids, input_class_ids):
-        raise RuntimeError("Feature and input sufficient-statistic class order diverged")
+        raise RuntimeError("Feature and input moment-statistic class order diverged")
     base_delta = state_delta(local, stale_global)
-    flat_delta = flatten_delta(base_delta)
-
-    if (
-        method == "fedmosaic"
-        and config.variant != "no_subspace"
-        and stable_basis is not None
-        and stable_basis.numel() > 0
-    ):
-        basis = stable_basis.to(flat_delta.device)
-        protected = basis @ (basis.T @ flat_delta)
-        flat_delta = flat_delta - config.stability_weight * protected
-        base_delta = unflatten_like(flat_delta, base_delta)
 
     with torch.no_grad():
         normalized_means = F.normalize(means, dim=1)
         alignment = (normalized_means * server_stats.anchors[class_ids]).sum(dim=1).mean()
         reliability = float(torch.sigmoid(4.0 * (alignment - 0.35)).item())
-        reliability *= math.exp(-staleness / max(config.staleness_tau, 1e-6))
 
     drift_event = _page_hinkley(
         client_state,
         float(np.mean(anchor_residuals)) if anchor_residuals else float(1.0 - alignment.item()),
     )
-    parameter_bytes = int(sum(tensor.numel() * tensor.element_size() for tensor in base_delta.values()))
+    # Every method uses the same FP16 wire codec. The server restores FP32
+    # arithmetic after decoding, so communication comparisons are not driven by
+    # method-specific numeric precision.
+    base_delta = type(base_delta)(
+        (name, tensor.to(torch.float16).to(tensor.dtype))
+        for name, tensor in base_delta.items()
+    )
+    parameter_bytes = int(sum(tensor.numel() * 2 for tensor in base_delta.values()))
     statistics_bytes = int(
         (
             means.numel()
@@ -382,34 +550,29 @@ def train_client(
         * 4
     )
     transmitted_statistics_bytes = statistics_bytes
-    if method == "fedmosaic":
-        (
-            means,
-            variances,
-            counts,
-            input_means,
-            input_variances,
-            input_counts,
-            transmitted_statistics_bytes,
-        ) = _encode_statistic_capsule(
+    if method == "fedgeski":
+        input_means, input_variances, input_counts, transmitted_statistics_bytes = (
+            _encode_input_statistic_capsule(
             class_ids,
-            means,
-            variances,
-            counts,
             input_means,
             input_variances,
             input_counts,
+            )
         )
     auxiliary_memory = (
         client_state.replay.bytes(stream.num_features)
         if uses_replay
-        else statistics_bytes
+        else (len(client_state.class_counts) * 8 if method == "fedgcc" else statistics_bytes)
+    )
+    uplink_bytes = parameter_bytes + (
+        transmitted_statistics_bytes if method in {"fedta", "fedgeski"} else 0
     )
     return LocalResult(
         delta=base_delta,
         samples=int(config.local_steps * config.batch_size),
         train_loss=float(np.mean(losses)),
         reliability=max(reliability, 1e-4),
+        anchor_alignment=float(alignment.item()),
         staleness=staleness,
         class_ids=class_ids.detach(),
         feature_means=means.detach(),
@@ -418,9 +581,10 @@ def train_client(
         input_means=input_means.detach(),
         input_variances=input_variances.detach(),
         input_counts=input_counts.detach(),
-        communication_bytes=parameter_bytes + (
-            transmitted_statistics_bytes if method in {"fedta", "fedmosaic"} else 0
-        ),
+        communication_bytes=uplink_bytes + parameter_bytes + input_bank_downlink_bytes,
+        uplink_communication_bytes=uplink_bytes,
+        downlink_communication_bytes=parameter_bytes + input_bank_downlink_bytes,
         auxiliary_memory_bytes=auxiliary_memory,
         drift_event=drift_event,
+        update_id=(client_id, round_id),
     )

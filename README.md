@@ -1,15 +1,17 @@
-# FedMOSAIC
+# FedGeSKI
 
-Official implementation of **FedMOSAIC: Memory-Efficient Orthogonal Simplex
-Anchors with Integrated Consolidation for Task-Free Asynchronous Federated
-Continual Intrusion Detection**.
+Official implementation of **FedGeSKI: Geometric-Statistical Knowledge
+Integration for Task-Free Federated Continual Intrusion Detection under
+Model-Age Staleness**.
 
-FedMOSAIC addresses federated continual intrusion detection when attack classes
+FedGeSKI addresses federated continual intrusion detection when attack classes
 arrive in client-dependent orders, local feature distributions drift, only a
 subset of clients participates, and updates may have different model ages. The
-method combines regular-simplex anchors, classwise sufficient statistics,
-stable-plastic projection, reliability-staleness-aware aggregation, replay-free
-server consolidation, and statistics-conditioned calibration.
+method combines regular-simplex anchors, classwise moment statistics,
+stable-plastic projection, reliability-staleness-aware aggregation, and
+record-free transient server consolidation. Default prediction uses the global
+encoder and classifier directly; posterior correction is retained only as an
+optional diagnostic control.
 
 This repository contains the complete Python pipeline for deterministic data
 preprocessing, federated simulation, baseline evaluation, statistical
@@ -27,8 +29,8 @@ included.
 Create an isolated environment and install the dependencies:
 
 ```bash
-git clone https://github.com/LieLieLieLieLie/FedMOSAIC.git
-cd FedMOSAIC
+git clone https://github.com/LieLieLieLieLie/FedGeSKI.git
+cd FedGeSKI
 python -m venv .venv
 ```
 
@@ -59,7 +61,7 @@ Extract the CSV files and create this directory structure at the repository
 root:
 
 ```text
-FedMOSAIC/
+FedGeSKI/
 |-- data/
 |   |-- EdgeIIoTset/
 |   |   `-- df_FL_Edge-IIoTset_6_classes.csv
@@ -82,10 +84,14 @@ Prepare both datasets with the protocol used in the experiments:
 python prepare_data.py --all
 ```
 
-The command performs deterministic classwise sampling, a stratified
-train/validation/test split, training-only robust scaling over the 5th--95th
-percentile range, and clipping to `[-12, 12]`. Processed arrays and preprocessing
-metadata are written to `data/processed/`.
+The command hashes each complete numerical feature vector before sampling,
+allocates each hash group to exactly one train/validation/test subset, performs
+deterministic classwise sampling, applies training-only robust scaling over the
+5th--95th percentile range, and clips to `[-12, 12]`. Processed arrays and
+machine-readable overlap checks are written to `data/processed/`. Because the
+six-class derivatives omit timestamps, device IDs, sessions, and flow IDs, this
+protocol prevents exact-feature duplicates across subsets but does not claim
+temporal-, device-, or session-disjoint generalization.
 
 To change the per-class sample count or preprocessing seed:
 
@@ -95,12 +101,12 @@ python prepare_data.py --all --per-class 6000 --seed 2026
 
 ## Quick verification
 
-Run a short FedMOSAIC experiment before launching the complete benchmark:
+Run a short FedGeSKI experiment before launching the complete benchmark:
 
 ```bash
 python run_experiment.py \
   --dataset edgeiiot \
-  --method fedmosaic \
+  --method fedgeski \
   --seed 99 \
   --rounds 2 \
   --local-steps 1 \
@@ -108,8 +114,11 @@ python run_experiment.py \
 ```
 
 Available dataset identifiers are `edgeiiot` and `ciciot`. Available method
-identifiers are `fedavg_er`, `glfc`, `evofedids`, `fedta`, `fedagc`, and
-`fedmosaic`.
+identifiers are `fedgcc`, `afcl_csc`, `fedavgm`, `fedadam`, `fedyogi`,
+`fedasync`, `fedbuff`, `glfc`, `evofedids`, `fedta`, `fedagc`, and
+`fedgeski`. `fedgcc` and `afcl_csc` are protocol-aligned adaptations for the
+common fixed-label tabular setting; they are not bit-for-bit reproductions of
+the source visual/pretrained systems.
 
 ## Reproducing the evaluation
 
@@ -118,9 +127,12 @@ cached and resumed:
 
 ```bash
 python run_all.py --suite main
+python run_all.py --suite asynchronous
 python run_all.py --suite stress
 python run_all.py --suite ablation
+python run_all.py --suite mechanism
 python run_all.py --suite sensitivity
+python run_all.py --suite extreme
 ```
 
 Use `python run_all.py --suite all` to execute every suite. By default, an
@@ -148,17 +160,28 @@ results/
 `-- logs/      # execution logs
 ```
 
-Visualization reads cached artifacts and does not retrain the models. The five
-baselines and FedMOSAIC share the same tabular encoder, evolving stream, client
-sampling process, optimizer budget, and evaluation implementation. Replay and
-other method-specific auxiliary states are included in the reported memory and
-communication accounting.
+Visualization reads cached artifacts and does not retrain the models. The
+eleven baselines and FedGeSKI share the same tabular encoder, evolving stream,
+client sampling process, optimizer budget, evaluation implementation, and FP16
+model-increment codec. FedGeSKI's input-moment capsule is counted
+separately, as is the FP16 server-to-client input-moment snapshot used for
+transient local statistical augmentation. Per-run JSON files expose uplink,
+downlink, and total communication independently. Replay, server-momentum,
+adaptive-moment, and other method-specific
+auxiliary states are included in the reported memory and communication
+accounting.
 
 ## Reproducibility notes
 
-- Main comparisons use seeds 0, 1, and 2.
+- Main comparisons and component controls use five matched seeds (0--4).
 - Stress tests vary client participation, Dirichlet label skew, and maximum
-  staleness.
+  model age. The three prespecified extreme conditions are repeated over five
+  seeds for Fed-GCC, AFCL-CSC, and FedGeSKI.
+- The bounded-model-age suite compares AFCL-CSC, FedAsync, FedBuff, and
+  FedGeSKI under matched delay schedules and bidirectional model encoding.
+- The mechanism suite repeats the full and statistics-only variants over five
+  seeds and records historical-gradient coverage and cross-version alignment
+  diagnostics.
 - The code records the complete experiment configuration in every JSON history.
 - Random generators and deterministic backend options are initialized from the
   experiment seed.

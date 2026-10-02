@@ -128,7 +128,7 @@ def regular_simplex(num_classes: int, embed_dim: int, device: torch.device) -> t
 
 
 class SimplexStatistics:
-    """Server-side sufficient statistics; no raw feature or traffic sample is retained."""
+    """Server-side moment statistics; no raw feature or traffic sample is retained."""
 
     def __init__(
         self,
@@ -156,7 +156,7 @@ class SimplexStatistics:
         input_means: Optional[torch.Tensor] = None,
         input_variances: Optional[torch.Tensor] = None,
         input_counts: Optional[torch.Tensor] = None,
-        momentum: float = 0.2,
+        momentum: float = 0.0,
     ) -> None:
         for row, class_id_tensor in enumerate(class_ids):
             class_id = int(class_id_tensor.item())
@@ -169,10 +169,14 @@ class SimplexStatistics:
                 self.counts[class_id] = counts[row]
                 self.active[class_id] = True
             else:
-                adaptive = max(momentum, incoming / (incoming + float(self.counts[class_id].item())))
-                adaptive = min(adaptive, 0.65)
+                old_count = float(self.counts[class_id].item())
+                adaptive = incoming / (incoming + old_count)
+                previous_mean = self.means[class_id].clone()
+                between = (1.0 - adaptive) * adaptive * (previous_mean - means[row]).pow(2)
                 self.means[class_id].lerp_(means[row], adaptive)
-                self.variances[class_id].lerp_(variances[row].clamp_min(1e-5), adaptive)
+                self.variances[class_id].mul_(1.0 - adaptive).add_(
+                    variances[row].clamp_min(1e-5), alpha=adaptive
+                ).add_(between).clamp_min_(1e-5)
                 self.counts[class_id] += counts[row]
             if input_means is not None and self.input_means.shape[1] > 0:
                 incoming_input = float(input_counts[row].item()) if input_counts is not None else incoming
@@ -181,16 +185,62 @@ class SimplexStatistics:
                     self.input_variances[class_id] = input_variances[row].clamp_min(1e-5)
                     self.input_counts[class_id] = incoming_input
                 else:
-                    adaptive_input = max(
-                        momentum,
-                        incoming_input / (incoming_input + float(self.input_counts[class_id].item())),
+                    old_input_count = float(self.input_counts[class_id].item())
+                    adaptive_input = incoming_input / (incoming_input + old_input_count)
+                    previous_input_mean = self.input_means[class_id].clone()
+                    between_input = (
+                        (1.0 - adaptive_input)
+                        * adaptive_input
+                        * (previous_input_mean - input_means[row]).pow(2)
                     )
-                    adaptive_input = min(adaptive_input, 0.65)
                     self.input_means[class_id].lerp_(input_means[row], adaptive_input)
-                    self.input_variances[class_id].lerp_(
-                        input_variances[row].clamp_min(1e-5), adaptive_input
-                    )
+                    self.input_variances[class_id].mul_(1.0 - adaptive_input).add_(
+                        input_variances[row].clamp_min(1e-5), alpha=adaptive_input
+                    ).add_(between_input).clamp_min_(1e-5)
                     self.input_counts[class_id] += incoming_input
+
+    @torch.no_grad()
+    def update_input(
+        self,
+        class_ids: torch.Tensor,
+        input_means: torch.Tensor,
+        input_variances: torch.Tensor,
+        input_counts: torch.Tensor,
+    ) -> None:
+        """Pool only the input moments used by FedGeSKI training.
+
+        Latent moments are intentionally not retained by the default protocol;
+        client-side anchor alignment is transmitted only as scalar reliability.
+        """
+        for row, class_id_tensor in enumerate(class_ids):
+            class_id = int(class_id_tensor.item())
+            incoming = float(input_counts[row].item())
+            if incoming <= 0:
+                continue
+            if self.input_counts[class_id] <= 0:
+                self.input_means[class_id] = input_means[row]
+                self.input_variances[class_id] = input_variances[row].clamp_min(1e-5)
+                self.input_counts[class_id] = incoming
+            else:
+                old_count = float(self.input_counts[class_id].item())
+                adaptive = incoming / (incoming + old_count)
+                previous_mean = self.input_means[class_id].clone()
+                between = (
+                    (1.0 - adaptive) * adaptive
+                    * (previous_mean - input_means[row]).pow(2)
+                )
+                self.input_means[class_id].lerp_(input_means[row], adaptive)
+                self.input_variances[class_id].mul_(1.0 - adaptive).add_(
+                    input_variances[row].clamp_min(1e-5), alpha=adaptive
+                ).add_(between).clamp_min_(1e-5)
+                self.input_counts[class_id] += incoming
+
+    def resident_bytes(self, include_latent: bool = True) -> int:
+        """Return persistent class-knowledge state, including fixed anchors."""
+        tensors = [self.anchors, self.input_means, self.input_variances, self.input_counts]
+        if include_latent:
+            tensors.extend((self.means, self.variances, self.counts, self.active))
+        return int(sum(t.numel() * t.element_size() for t in tensors))
 
     def sample_inputs(
         self,
@@ -230,15 +280,18 @@ class SimplexStatistics:
     ) -> torch.Tensor:
         normalized = F.normalize(features, dim=1)
         anchor_logits = anchor_scale * (normalized @ self.anchors.T)
-        if self.active.any():
-            dispersion = self.variances.mean(dim=1).sqrt().clamp(0.05, 5.0)
-            dispersion = dispersion / dispersion[self.active].mean().clamp_min(1e-5)
+        active = self.active if self.active.any() else self.input_counts > 0
+        counts = self.counts if self.active.any() else self.input_counts
+        if active.any():
+            source_variances = self.variances if self.active.any() else self.input_variances
+            dispersion = source_variances.mean(dim=1).sqrt().clamp(0.05, 5.0)
+            dispersion = dispersion / dispersion[active].mean().clamp_min(1e-5)
             anchor_logits = anchor_logits / (1.0 + calibration_weight * dispersion.unsqueeze(0))
-            counts = self.counts.clamp_min(1.0)
-            active_mean = counts[self.active].log().mean()
+            counts = counts.clamp_min(1.0)
+            active_mean = counts[active].log().mean()
             bias = -(counts.log() - active_mean) * calibration_weight
             anchor_logits = anchor_logits + bias.unsqueeze(0)
-        inactive = ~self.active
+        inactive = ~active
         anchor_logits[:, inactive] = -20.0
         return (1.0 - calibration_weight) * model_logits + calibration_weight * anchor_logits
 

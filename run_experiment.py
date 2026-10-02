@@ -10,7 +10,7 @@ from federated import run_experiment
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=tuple(DATASETS), default="edgeiiot")
-    parser.add_argument("--method", choices=METHODS, default="fedmosaic")
+    parser.add_argument("--method", choices=METHODS, default="fedgeski")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rounds", type=int, default=25)
     parser.add_argument("--local-steps", type=int, default=5)
